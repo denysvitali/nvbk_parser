@@ -1,0 +1,38 @@
+//------------------------------------------------
+//--- 010 Editor v8.0.1 Binary Template
+//
+//      File: 
+//   Authors: 
+//   Version: 
+//   Purpose: 
+//  Category: 
+// File Mask: 
+//  ID Bytes: 
+//   History: 
+//------------------------------------------------
+struct Header {
+    char identifier[7] <bgcolor=0xF4A903>;
+    byte unkn_1 [5] <bgcolor=0x227ee6>;
+    unsigned short total_items <bgcolor=0x2b39c0>;
+    byte unknown[512-5-7-2];
+} header;
+
+struct Unkn {
+    byte unkn_2[56];
+} unkn;
+
+struct Entry {
+    string fileName <bgcolor=0x3c4ce7>;
+    unsigned short separator;
+    unsigned short fileSize <bgcolor=0xad448e>;
+    
+    local quad _here = FTell();
+    FSeek(_here + fileSize);
+
+    byte footer[12];
+    
+    if (separator != 0x02){
+        Warning("Invalid separator!");
+    }
+    
+} entries[999] <optimize=false>;
