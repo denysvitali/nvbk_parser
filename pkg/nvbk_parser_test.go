@@ -1,4 +1,4 @@
-package pkg
+package nvbk_parser
 
 import (
 	"github.com/stretchr/testify/assert"
@@ -6,7 +6,8 @@ import (
 )
 
 func TestParseStaNVBKFileOP5TH2OS10(t *testing.T) {
-	parsedFile := ReadFile("../resources/op5t_h2os_10.0.0b4_stanvbk.img")
+	parsedFile, err := ReadFile("../resources/op5t_h2os_10.0.0b4_stanvbk.img")
+	assert.Nil(t, err)
 	assert.Equal(t,116, parsedFile.Header.Total)
 	assert.Equal(t,116, parsedFile.Header.Valid)
 	assert.Equal(t,true, parsedFile.Header.Verify)
@@ -14,7 +15,8 @@ func TestParseStaNVBKFileOP5TH2OS10(t *testing.T) {
 }
 
 func TestParseDycNVBKFileOP5TH2OS10(t *testing.T) {
-	parsedFile := ReadFile("../resources/op5t_h2os_10.0.0b4_dycnvbk.img")
+	parsedFile, err := ReadFile("../resources/op5t_h2os_10.0.0b4_dycnvbk.img")
+	assert.Nil(t, err)
 	assert.Equal(t,1233, parsedFile.Header.Total)
 	assert.Equal(t,1233, parsedFile.Header.Valid)
 	assert.Equal(t,true, parsedFile.Header.Verify)
@@ -22,7 +24,8 @@ func TestParseDycNVBKFileOP5TH2OS10(t *testing.T) {
 }
 
 func TestParseStaNVBKFileOP8PROO2OS1056(t *testing.T) {
-	parsedFile := ReadFile("../resources/op8pro_o2os_10.5.6.in11ba_stanvbk.img")
+	parsedFile, err := ReadFile("../resources/op8pro_o2os_10.5.6.in11ba_stanvbk_trimmed.img")
+	assert.Nil(t, err)
 	assert.Equal(t, 86, parsedFile.Header.Total)
 	assert.Equal(t, 86, parsedFile.Header.Total)
 	assert.Equal(t, true, parsedFile.Header.Verify)
@@ -30,7 +33,8 @@ func TestParseStaNVBKFileOP8PROO2OS1056(t *testing.T) {
 }
 
 func TestParseDycNVBKFileOP8PROO2OS1056(t *testing.T) {
-	parsedFile := ReadFile("../resources/op8pro_o2os_10.5.6.in11ba_dycnvbk.img")
+	parsedFile, err := ReadFile("../resources/op8pro_o2os_10.5.6.in11ba_dycnvbk_trimmed.img")
+	assert.Nil(t, err)
 	assert.Equal(t, 33, parsedFile.Header.Total)
 	assert.Equal(t, 33, parsedFile.Header.Valid)
 	assert.Equal(t, true, parsedFile.Header.Verify)

@@ -1,10 +1,12 @@
-package pkg
+package nvbk_parser
 
 import (
 	"bytes"
 	"encoding/binary"
-	"github.com/Sirupsen/logrus"
+	"errors"
+	"fmt"
 	"github.com/denysvitali/nvbk_parser/pkg/nvbk"
+	"github.com/sirupsen/logrus"
 	"io/ioutil"
 	"log"
 )
@@ -71,11 +73,11 @@ func (r *NVBKReader) PeekByte() byte {
 	return b
 }
 
-func ReadFile(path string) nvbk.NVBKFile {
+func ReadFile(path string) (*nvbk.NVBKFile, error) {
 	b, err := ioutil.ReadFile(path)
 
 	if err != nil {
-		Log.Fatalf("Unable to open file: %v", err)
+		return nil, errors.New(fmt.Sprintf("Unable to open file: %v", err))
 	}
 
 	nvr := NVBKReader{reader: bytes.NewReader(b)}
@@ -92,15 +94,15 @@ func ReadFile(path string) nvbk.NVBKFile {
 
 
 	// Ignore everything past this line:
-	total_items_bytes, err := nvr.ReadBytes(2)
-	total_items := binary.BigEndian.Uint16(total_items_bytes)
+	totalItemsBytes, err := nvr.ReadBytes(2)
+	totalItems := binary.BigEndian.Uint16(totalItemsBytes)
 
 	outputFile := nvbk.NVBKFile{
 		Header: nvbk.NVBKHeader{},
 	}
 
-	outputFile.Header.Total = int(total_items)
+	outputFile.Header.Total = int(totalItems)
 
-	logrus.Debugf("found %d entries", total_items)
-	return outputFile
+	logrus.Debugf("found %d entries", totalItems)
+	return &outputFile, nil
 }
