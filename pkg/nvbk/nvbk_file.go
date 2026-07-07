@@ -2,14 +2,18 @@ package nvbk
 
 // NVBKHeader holds the parsed metadata from the 512-byte OEMNVBK header.
 type NVBKHeader struct {
-	Magic        string
-	Version      [4]byte
-	SubFileCount int
-	TableOffset  uint32
-	BuildTime    string
-	Total        int
-	Valid        int
-	Verify       bool
+	Magic               string
+	Version             [4]byte
+	SubFileCount        int
+	TableOffset         uint32
+	HeaderFlag          byte
+	BuildTime           string
+	ReservedAfterBuild  [1]byte
+	SignatureOrReserved [6]byte
+	HeaderRemainder     []byte `json:"-"`
+	Total               int
+	Valid               int
+	Verify              bool
 }
 
 // NVBKEntry represents a single NV item / file extracted from a sub-file.
@@ -33,7 +37,9 @@ type NVBKSubFile struct {
 	NumSectors  uint16
 	RFID        byte
 	CountHint   byte
-	Raw         []byte
+	PayloadHash []byte `json:"-"`
+	Verified    bool
+	Raw         []byte `json:"-"`
 	Entries     []NVBKEntry
 	Items       []NVBKItem
 	ItemCount   int

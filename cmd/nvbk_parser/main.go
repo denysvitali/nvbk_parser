@@ -55,10 +55,12 @@ func init() {
 	rootCmd.PersistentFlags().StringP("file", "f", "", "OEMNVBK file to parse")
 	rootCmd.PersistentFlags().StringP("format", "o", "table", "output format: table, json")
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "enable verbose logging")
+	rootCmd.PersistentFlags().BoolP("verify", "", false, "show SHA-256 payload verification details")
 
 	_ = viper.BindPFlag("file", rootCmd.PersistentFlags().Lookup("file"))
 	_ = viper.BindPFlag("format", rootCmd.PersistentFlags().Lookup("format"))
 	_ = viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
+	_ = viper.BindPFlag("verify", rootCmd.PersistentFlags().Lookup("verify"))
 
 	rootCmd.AddCommand(infoCmd, listCmd, nvGetCmd)
 }
@@ -140,23 +142,42 @@ func renderInfoTable(f *nvbk.NVBKFile) error {
 		f.Header.Version[0], f.Header.Version[1], f.Header.Version[2], f.Header.Version[3])
 	fmt.Printf("%s %d\n", keyStyle.Render("Sub-files:  "), f.Header.SubFileCount)
 	fmt.Printf("%s 0x%x\n", keyStyle.Render("Table off:  "), f.Header.TableOffset)
+	fmt.Printf("%s 0x%02x\n", keyStyle.Render("Header flg: "), f.Header.HeaderFlag)
 	fmt.Printf("%s %s\n", keyStyle.Render("Build time: "), f.Header.BuildTime)
 	fmt.Printf("%s %d\n", keyStyle.Render("Total:      "), f.Header.Total)
 	fmt.Printf("%s %d\n", keyStyle.Render("Valid:      "), f.Header.Valid)
 	fmt.Printf("%s %v\n", keyStyle.Render("Verify:     "), f.Header.Verify)
 
+	showVerify := viper.GetBool("verify")
+
 	rows := [][]string{
-		{"#", "Start", "Sectors", "RF ID", "Hint", "Items"},
+		{"#", "Start", "Sectors", "RF ID", "RF name", "Hint", "Items"},
+	}
+	if showVerify {
+		rows[0] = append(rows[0], "Verified")
 	}
 	for _, sf := range f.SubFiles {
-		rows = append(rows, []string{
+		rfName := nvbk.LookupRFIDName(sf.RFID)
+		if rfName == "" {
+			rfName = "-"
+		}
+		row := []string{
 			fmt.Sprintf("%d", sf.Index),
 			fmt.Sprintf("0x%x", sf.StartSector),
 			fmt.Sprintf("%d", sf.NumSectors),
 			fmt.Sprintf("0x%02x", sf.RFID),
+			rfName,
 			fmt.Sprintf("%d", sf.CountHint),
 			fmt.Sprintf("%d", sf.ItemCount),
-		})
+		}
+		if showVerify {
+			verified := "no"
+			if sf.Verified {
+				verified = "yes"
+			}
+			row = append(row, verified)
+		}
+		rows = append(rows, row)
 	}
 
 	t := table.New().
@@ -203,6 +224,9 @@ func runList(cmd *cobra.Command, args []string) error {
 			for _, it := range sf.Items {
 				name := it.Name
 				if name == "" {
+					name = nvbk.LookupNVItemName(it.ID)
+				}
+				if name == "" {
 					name = fmt.Sprintf("NV ITEM %05d", it.ID)
 				}
 				out = append(out, map[string]any{
@@ -243,6 +267,9 @@ func renderListTable(f *nvbk.NVBKFile) error {
 		}
 		for _, it := range sf.Items {
 			name := it.Name
+			if name == "" {
+				name = nvbk.LookupNVItemName(it.ID)
+			}
 			if name == "" {
 				name = fmt.Sprintf("NV ITEM %05d", it.ID)
 			}
