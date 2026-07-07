@@ -175,6 +175,8 @@ func parseSubFileDescriptors(r *reader, hdr nvbk.NVBKHeader) ([]nvbk.NVBKSubFile
 		sf.Entries = parseEntries(raw)
 		sf.ItemCount = len(sf.Entries)
 
+		sf.Items = parseNVItems(raw)
+
 		// Some sub-files are compressed blobs of NV items.
 		sf.ItemCount = max(sf.ItemCount, compressedItemCount(raw))
 		sf.ItemCount = max(sf.ItemCount, int(sf.CountHint))
@@ -248,6 +250,136 @@ func compressedItemCount(raw []byte) int {
 		return 0
 	}
 	return int(buf[7])
+}
+
+// parseNVItems extracts numeric NV item IDs from sub-files that use the
+// ID-directory format. It tries every zlib stream inside the sub-file (and the
+// raw bytes) and returns the directory with the most IDs.
+func parseNVItems(raw []byte) []nvbk.NVBKItem {
+	var best []nvbk.NVBKItem
+
+	if items := parseNVItemDirectory(raw); len(items) > len(best) {
+		best = items
+	}
+
+	start := 0
+	for {
+		idx := bytes.Index(raw[start:], []byte{0x78, 0x9c})
+		if idx < 0 {
+			break
+		}
+		idx += start
+		zr, err := zlib.NewReader(bytes.NewReader(raw[idx:]))
+		if err == nil {
+			out, _ := io.ReadAll(zr)
+			zr.Close()
+			if items := parseNVItemDirectory(out); len(items) > len(best) {
+				best = items
+			}
+		}
+		start = idx + 1
+	}
+
+	return best
+}
+
+// parseNVItemDirectory parses a single ID-directory payload.
+// The header has a count at offset 7 and is followed by 24-byte groups; each
+// group contains four 6-byte slots (4 zero bytes + 2-byte ID in little-endian).
+func parseNVItemDirectory(data []byte) []nvbk.NVBKItem {
+	if len(data) < 16 {
+		return nil
+	}
+
+	if data[0] != 0 || data[1] != 0 || data[7] == 0 {
+		return nil
+	}
+
+	// Directory signatures observed in static_nvbk ID tables: byte 4 is 0x34.
+	if data[4] != 0x34 {
+		return nil
+	}
+
+	count := int(data[7])
+	if len(data) < 16+count*24 {
+		return nil
+	}
+
+	// Validate that most slots have the expected zero prefix; otherwise this is
+	// probably compressed container data rather than an ID directory.
+	zeroPrefix := 0
+	totalSlots := count * 4
+	for i := range count {
+		off := 16 + i*24
+		for slot := range 4 {
+			if binary.LittleEndian.Uint32(data[off+slot*6 : off+slot*6+4]) == 0 {
+				zeroPrefix++
+			}
+		}
+	}
+	if zeroPrefix*2 < totalSlots {
+		return nil
+	}
+
+	var items []nvbk.NVBKItem
+	for i := range count {
+		off := 16 + i*24
+		for slot := range 4 {
+			idOff := off + slot*6 + 4
+			id := binary.LittleEndian.Uint16(data[idOff : idOff+2])
+			if id != 0 {
+				items = append(items, nvbk.NVBKItem{ID: id})
+			}
+		}
+	}
+	return items
+}
+
+// FindNVItem searches all sub-files (including zlib-compressed streams) for a
+// numeric NV item record with the given ID. It returns the sub-file index and
+// the record's data payload, or -1/nil if not found.
+func FindNVItem(f *nvbk.NVBKFile, id uint16) (int, []byte) {
+	idBytes := [2]byte{byte(id), byte(id >> 8)}
+
+	for _, sf := range f.SubFiles {
+		if data := findNVItemInBlob(sf.Raw, idBytes); data != nil {
+			return sf.Index, data
+		}
+
+		start := 0
+		for {
+			idx := bytes.Index(sf.Raw[start:], []byte{0x78, 0x9c})
+			if idx < 0 {
+				break
+			}
+			idx += start
+			zr, err := zlib.NewReader(bytes.NewReader(sf.Raw[idx:]))
+			if err == nil {
+				out, _ := io.ReadAll(zr)
+				zr.Close()
+				if data := findNVItemInBlob(out, idBytes); data != nil {
+					return sf.Index, data
+				}
+			}
+			start = idx + 1
+		}
+	}
+
+	return -1, nil
+}
+
+func findNVItemInBlob(blob []byte, idBytes [2]byte) []byte {
+	for i := range len(blob) - 4 {
+		if blob[i] != idBytes[0] || blob[i+1] != idBytes[1] {
+			continue
+		}
+		total := int(binary.LittleEndian.Uint16(blob[i+2 : i+4]))
+		if total < 4 || total > 0x1000 || i+total > len(blob) {
+			continue
+		}
+		return blob[i+4 : i+total]
+	}
+	return nil
 }
 
 func populateSummary(f *nvbk.NVBKFile) {

@@ -19,6 +19,13 @@ type NVBKEntry struct {
 	Data []byte
 }
 
+// NVBKItem represents a numeric NV item (ID-based) extracted from a sub-file.
+type NVBKItem struct {
+	ID   uint16
+	Name string
+	Data []byte
+}
+
 // NVBKSubFile describes one sub-file descriptor and its decoded contents.
 type NVBKSubFile struct {
 	Index       int
@@ -28,6 +35,7 @@ type NVBKSubFile struct {
 	CountHint   byte
 	Raw         []byte
 	Entries     []NVBKEntry
+	Items       []NVBKItem
 	ItemCount   int
 }
 

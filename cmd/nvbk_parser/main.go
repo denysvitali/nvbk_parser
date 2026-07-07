@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -37,6 +39,13 @@ var (
 		Args:  cobra.MaximumNArgs(1),
 		RunE:  runList,
 	}
+
+	nvGetCmd = &cobra.Command{
+		Use:   "nv-get <id> [file]",
+		Short: "Extract a numeric NV item by ID",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE:  runNVGet,
+	}
 )
 
 func init() {
@@ -51,7 +60,7 @@ func init() {
 	_ = viper.BindPFlag("format", rootCmd.PersistentFlags().Lookup("format"))
 	_ = viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
 
-	rootCmd.AddCommand(infoCmd, listCmd)
+	rootCmd.AddCommand(infoCmd, listCmd, nvGetCmd)
 }
 
 func initConfig() {
@@ -180,14 +189,28 @@ func runList(cmd *cobra.Command, args []string) error {
 	format := strings.ToLower(viper.GetString("format"))
 	switch format {
 	case "json":
-		var out []map[string]interface{}
+		var out []map[string]any
 		for _, sf := range f.SubFiles {
 			for _, e := range sf.Entries {
-				out = append(out, map[string]interface{}{
+				out = append(out, map[string]any{
 					"sub_file": sf.Index,
+					"type":     "entry",
 					"name":     e.Name,
 					"tag":      fmt.Sprintf("0x%08x", e.Tag),
 					"size":     len(e.Data),
+				})
+			}
+			for _, it := range sf.Items {
+				name := it.Name
+				if name == "" {
+					name = fmt.Sprintf("NV ITEM %05d", it.ID)
+				}
+				out = append(out, map[string]any{
+					"sub_file": sf.Index,
+					"type":     "nv_item",
+					"name":     name,
+					"id":       it.ID,
+					"size":     len(it.Data),
 				})
 			}
 		}
@@ -203,7 +226,7 @@ func runList(cmd *cobra.Command, args []string) error {
 
 func renderListTable(f *nvbk.NVBKFile) error {
 	rows := [][]string{
-		{"Sub", "Name", "Tag", "Size"},
+		{"Sub", "Name", "Tag / ID", "Size"},
 	}
 	for _, sf := range f.SubFiles {
 		for _, e := range sf.Entries {
@@ -218,10 +241,22 @@ func renderListTable(f *nvbk.NVBKFile) error {
 				fmt.Sprintf("%d", len(e.Data)),
 			})
 		}
+		for _, it := range sf.Items {
+			name := it.Name
+			if name == "" {
+				name = fmt.Sprintf("NV ITEM %05d", it.ID)
+			}
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", sf.Index),
+				name,
+				fmt.Sprintf("%d", it.ID),
+				fmt.Sprintf("%d", len(it.Data)),
+			})
+		}
 	}
 
 	if len(rows) == 1 {
-		fmt.Println("No path-based entries were parsed from this image.")
+		fmt.Println("No path-based entries or numeric NV items were parsed from this image.")
 		return nil
 	}
 
@@ -238,4 +273,48 @@ func renderListTable(f *nvbk.NVBKFile) error {
 
 	fmt.Println(t.Render())
 	return nil
+}
+
+func runNVGet(cmd *cobra.Command, args []string) error {
+	setupLogging()
+
+	id, err := strconv.ParseUint(args[0], 0, 16)
+	if err != nil {
+		return fmt.Errorf("invalid NV item ID %q: %w", args[0], err)
+	}
+
+	path, err := targetPath(args[1:])
+	if err != nil {
+		return err
+	}
+
+	f, err := nvbkparser.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	subFileIdx, data := nvbkparser.FindNVItem(f, uint16(id))
+	if subFileIdx < 0 {
+		return fmt.Errorf("NV item %d not found", id)
+	}
+
+	format := strings.ToLower(viper.GetString("format"))
+	switch format {
+	case "json":
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"id":       id,
+			"sub_file": subFileIdx,
+			"size":     len(data),
+			"hex":      hex.EncodeToString(data),
+		})
+	case "table", "":
+		fmt.Printf("NV item %d (sub-file %d, %d bytes):\n", id, subFileIdx, len(data))
+		for i := 0; i < len(data); i += 16 {
+			end := min(i+16, len(data))
+			fmt.Printf("%04x  %s\n", i, hex.EncodeToString(data[i:end]))
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown output format: %s", format)
+	}
 }
