@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Check formatting
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "The following files are not formatted:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
+
+  parse-samples:
+    name: Parse Sample Files
+    runs-on: ubuntu-latest
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        sample:
+          - resources/oem_stanvbk-2019-10-23
+          - resources/op7t_oem_stanvbk.img
+          - resources/op8pro_o2os_10.5.6.in11ba_dycnvbk_trimmed.img
+          - resources/op8pro_o2os_10.5.6.in11ba_stanvbk_trimmed.img
+          - resources/oplusstanvbk.img
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build CLI
+        run: go build -o nvbk_parser ./cmd/nvbk_parser
+
+      - name: Run info
+        run: ./nvbk_parser info "${{ matrix.sample }}"
+
+      - name: Run list
+        run: ./nvbk_parser list "${{ matrix.sample }}"
+
+      - name: Run list (JSON)
+        run: ./nvbk_parser list -o json "${{ matrix.sample }}" | jq . > /dev/null
+
+      - name: Run info (JSON)
+        run: ./nvbk_parser info -o json "${{ matrix.sample }}" | jq . > /dev/null

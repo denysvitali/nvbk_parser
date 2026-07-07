@@ -312,7 +312,7 @@ func parseNVItemDirectory(data []byte) []nvbk.NVBKItem {
 	for i := range count {
 		off := 16 + i*24
 		for slot := range 4 {
-			if binary.LittleEndian.Uint32(data[off+slot*6 : off+slot*6+4]) == 0 {
+			if binary.LittleEndian.Uint32(data[off+slot*6:off+slot*6+4]) == 0 {
 				zeroPrefix++
 			}
 		}
