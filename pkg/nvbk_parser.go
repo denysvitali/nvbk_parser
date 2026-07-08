@@ -19,6 +19,7 @@ var Log = logrus.New()
 const (
 	headerSize      = 0x200
 	subFileDescSize = 0x29
+	sectorSize      = 512
 )
 
 // ReadFile parses an OEMNVBK image and returns its structure.
@@ -49,7 +50,6 @@ func ReadFile(path string) (*nvbk.NVBKFile, error) {
 		SubFiles: subFiles,
 	}
 
-	// Compute derived header values.
 	populateSummary(file)
 
 	Log.Debugf("parsed %s: buildTime=%s subFiles=%d total=%d valid=%d verify=%v",
@@ -82,24 +82,10 @@ func (r *reader) ReadBytes(n int) ([]byte, error) {
 	return out, nil
 }
 
-func (r *reader) Skip(n int) error {
-	if r.pos+n > len(r.buf) {
-		return io.EOF
-	}
-	r.pos += n
-	return nil
-}
-
-func (r *reader) PeekByte() (byte, error) {
-	if r.pos >= len(r.buf) {
-		return 0, io.EOF
-	}
-	return r.buf[r.pos], nil
-}
-
 func parseHeader(r *reader) (nvbk.NVBKHeader, error) {
 	var hdr nvbk.NVBKHeader
 
+	// Magic is 8 bytes: "OEMNVBK" + NUL.
 	magic, err := r.ReadBytes(8)
 	if err != nil {
 		return hdr, fmt.Errorf("unable to read magic: %w", err)
@@ -154,6 +140,8 @@ func parseHeader(r *reader) (nvbk.NVBKHeader, error) {
 	}
 	copy(hdr.SignatureOrReserved[:], sig)
 
+	// Bytes from table_offset to 0x200 hold the descriptor table (and pad).
+	// Stored opaque for round-trip / hex dumps; descriptors re-parsed below.
 	remainder, err := r.ReadBytes(headerSize - r.pos)
 	if err != nil {
 		return hdr, fmt.Errorf("unable to read header remainder: %w", err)
@@ -174,12 +162,14 @@ func parseSubFileDescriptors(r *reader, hdr nvbk.NVBKHeader) ([]nvbk.NVBKSubFile
 		off := int(hdr.TableOffset) + i*subFileDescSize
 		desc := r.buf[off : off+subFileDescSize]
 
+		// Descriptor: u32 record_count | u16 start | u16 nsec | sha256[32] | rf_id
+		recordCount := binary.LittleEndian.Uint32(desc[0:4])
 		startSector := binary.LittleEndian.Uint16(desc[4:6])
 		numSectors := binary.LittleEndian.Uint16(desc[6:8])
 		rfID := desc[0x28]
 
-		start := int(startSector) * 512
-		length := int(numSectors) * 512
+		start := int(startSector) * sectorSize
+		length := int(numSectors) * sectorSize
 		if start+length > len(r.buf) {
 			Log.Warnf("sub-file %d exceeds file bounds, truncating", i)
 			length = max(len(r.buf)-start, 0)
@@ -188,32 +178,40 @@ func parseSubFileDescriptors(r *reader, hdr nvbk.NVBKHeader) ([]nvbk.NVBKSubFile
 		raw := r.buf[start : start+length]
 		sf := nvbk.NVBKSubFile{
 			Index:       i,
+			RecordCount: recordCount,
 			StartSector: startSector,
 			NumSectors:  numSectors,
 			RFID:        rfID,
-			CountHint:   desc[0],
 			PayloadHash: append([]byte(nil), desc[8:40]...),
 			Raw:         raw,
 		}
 
-		expectedLength := int(numSectors) * 512
-		actualLength := length
-		if actualLength < expectedLength {
-			Log.Warnf("sub-file %d is truncated: expected %d bytes, got %d; hash verification skipped", i, expectedLength, actualLength)
+		expectedLength := int(numSectors) * sectorSize
+		if length < expectedLength {
+			Log.Warnf("sub-file %d is truncated: expected %d bytes, got %d; hash verification skipped", i, expectedLength, length)
 		} else {
 			hash := sha256.Sum256(raw)
 			sf.Verified = bytes.Equal(hash[:], sf.PayloadHash)
 		}
 
-		sf.Entries = parseEntries(raw)
-		sf.Items = parseNVItems(raw)
+		sf.Records, sf.BytesCovered = parseRecords(raw)
+		sf.Entries = entriesFromRecords(sf.Records)
+		sf.Items = itemsFromRecords(sf.Records)
 
-		// ItemCount is derived from the directory/count hints rather than the
-		// path-based entry list so that the header summary stays stable when the
-		// parser discovers additional metadata records.
-		sf.ItemCount = compressedItemCount(raw)
-		sf.ItemCount = max(sf.ItemCount, len(sf.Items))
-		sf.ItemCount = max(sf.ItemCount, int(sf.CountHint))
+		// Nested zlib ID-directory recovery (RF cal blobs).
+		sf.Items = mergeItems(sf.Items, parseNVItems(raw))
+
+		// ItemCount = walked records (authoritative). Descriptor count should match.
+		sf.ItemCount = len(sf.Records)
+		if int(sf.RecordCount) > sf.ItemCount {
+			// Truncated image: descriptor claims more than we could walk.
+			sf.ItemCount = int(sf.RecordCount)
+		}
+
+		if sf.Verified && uint32(len(sf.Records)) != sf.RecordCount {
+			Log.Warnf("sub-file %d record count mismatch: descriptor=%d walked=%d",
+				i, sf.RecordCount, len(sf.Records))
+		}
 
 		subFiles = append(subFiles, sf)
 	}
@@ -221,149 +219,296 @@ func parseSubFileDescriptors(r *reader, hdr nvbk.NVBKHeader) ([]nvbk.NVBKSubFile
 	return subFiles, nil
 }
 
-// parseEntries parses the simple path-based entry format used by uncompressed
-// sub-files. The layout is:
+// parseRecords walks the contiguous TLV stream that makes up a sub-file.
 //
-//	[4:total] [4:tag] [2:typeMarker=0x0001] [2:pathLenWithNull] [path] [2:sep=0x0002] [2:dataLen] [data]
+// Every record:
 //
-// Metadata records (typeMarker != 0x0001) are skipped. The first entry is found
-// by scanning; subsequent entries are parsed contiguously until the data ends or
-// a record does not match the expected structure.
-func parseEntries(raw []byte) []nvbk.NVBKEntry {
-	if len(raw) < 12 {
-		return nil
-	}
-
-	var entries []nvbk.NVBKEntry
+//	u32 total | u8 type | u8 attr | u8 rfid | u8 flags | payload…
+//
+// Kind 0x01 / 0xF1 / 0xF3: numeric item (u16 id, u16 dataLen, data)
+// Kind 0x02 / 0xF2 / 0xF4: path entry (u16 marker=1, u16 pathLen, path, sep, data)
+// Trailing sector zero-padding ends the walk.
+func parseRecords(raw []byte) ([]nvbk.NVBKRecord, int) {
+	var records []nvbk.NVBKRecord
 	off := 0
-	scanning := true
 
-	for off+12 <= len(raw) {
-		// Stop cleanly on sector-boundary zero padding.
-		if off+12 <= len(raw) && bytes.Equal(raw[off:off+12], make([]byte, 12)) {
+	for off+8 <= len(raw) {
+		// Only treat leading zeros as end-of-stream (sector pad). Do not scan
+		// for zeros mid-record (that broke dycnvbk path recovery).
+		if isZero(raw[off:min(off+8, len(raw))]) {
 			break
-		}
-
-		typeMarker := binary.LittleEndian.Uint16(raw[off+8 : off+10])
-		if scanning {
-			if typeMarker != 0x0001 {
-				off++
-				continue
-			}
-			// Path entries have the tag low-byte set to 0x02.
-			tag := binary.LittleEndian.Uint32(raw[off+4 : off+8])
-			if byte(tag) != 0x02 {
-				off++
-				continue
-			}
-			scanning = false
-		} else {
-			if typeMarker != 0x0001 {
-				break
-			}
 		}
 
 		total := int(binary.LittleEndian.Uint32(raw[off : off+4]))
-		if total == 0 || off+total > len(raw) || total < 12 {
-			if scanning {
-				off++
-				continue
-			}
+		if total < 8 || off+total > len(raw) {
 			break
 		}
 
-		tag := binary.LittleEndian.Uint32(raw[off+4 : off+8])
-		if byte(tag) != 0x02 {
-			if scanning {
-				off++
-				continue
-			}
-			break
+		body := raw[off : off+total]
+		rec := nvbk.NVBKRecord{
+			Offset: off,
+			Total:  total,
+			Type:   body[4],
+			Attr:   body[5],
+			RFID:   body[6],
+			Flags:  body[7],
 		}
 
-		pathLen := int(binary.LittleEndian.Uint16(raw[off+10 : off+12]))
-		if pathLen == 0 || off+12+pathLen > off+total {
-			if scanning {
-				off++
-				continue
+		switch {
+		case nvbk.IsPathType(rec.Type):
+			parsePathRecord(body, &rec)
+		case nvbk.IsItemType(rec.Type):
+			parseItemRecord(body, &rec)
+		default:
+			if total > 8 {
+				rec.Data = append([]byte(nil), body[8:]...)
 			}
-			break
+			tryDecompressPayload(body, &rec)
 		}
 
-		pathBytes := raw[off+12 : off+12+pathLen]
-		nameBytes, _, ok := bytes.Cut(pathBytes, []byte{0})
-		if !ok {
-			if scanning {
-				off++
-				continue
-			}
-			break
-		}
-		name := string(nameBytes)
-
-		sepOff := off + 12 + pathLen
-		if sepOff+2 > off+total {
-			if scanning {
-				off++
-				continue
-			}
-			break
-		}
-		separator := binary.LittleEndian.Uint16(raw[sepOff : sepOff+2])
-		if separator != 0x0002 {
-			if scanning {
-				off++
-				continue
-			}
-			break
-		}
-
-		dataStart := sepOff + 4 // skip separator + dataLen
-		if dataStart > off+total {
-			if scanning {
-				off++
-				continue
-			}
-			break
-		}
-		data := raw[dataStart : off+total]
-
-		entries = append(entries, nvbk.NVBKEntry{
-			Name: name,
-			Tag:  tag,
-			Data: data,
-		})
-
+		records = append(records, rec)
 		off += total
 	}
-	return entries
+
+	return records, off
 }
 
-// compressedItemCount looks for a zlib stream inside the sub-file and, when
-// decompressed, returns the byte at offset 7 which appears to hold the number
-// of NV items in static_nvbk compressed blobs.
-func compressedItemCount(raw []byte) int {
-	idx := bytes.Index(raw, []byte{0x78, 0x9c})
-	if idx < 0 {
-		return 0
+func isZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
 	}
-	zr, err := zlib.NewReader(bytes.NewReader(raw[idx:]))
+	return len(b) > 0
+}
+
+// parsePathRecord decodes path-type entries (0x02 / 0xF2 / 0xF4).
+//
+//	[4 total][1 type][1 attr][1 rfid][1 flags]
+//	[2 marker=0x0001][2 pathLen][path][2 sep=0x0002][2 dataLen][data]
+func parsePathRecord(body []byte, rec *nvbk.NVBKRecord) {
+	if len(body) < 12 {
+		return
+	}
+	marker := binary.LittleEndian.Uint16(body[8:10])
+	pathLen := int(binary.LittleEndian.Uint16(body[10:12]))
+	if marker != 0x0001 || pathLen <= 0 || 12+pathLen > len(body) {
+		rec.Data = append([]byte(nil), body[8:]...)
+		tryDecompressPayload(body, rec)
+		return
+	}
+
+	pathBytes := body[12 : 12+pathLen]
+	nameBytes, _, _ := bytes.Cut(pathBytes, []byte{0})
+	rec.Name = string(nameBytes)
+
+	sepOff := 12 + pathLen
+	if sepOff+4 > len(body) {
+		return
+	}
+	// sep should be 0x0002; data follows the dataLen field.
+	dataStart := sepOff + 4
+	if dataStart > len(body) {
+		return
+	}
+	rec.Data = append([]byte(nil), body[dataStart:]...)
+	tryDecompressPayload(body, rec)
+}
+
+// parseItemRecord decodes item-type entries (0x01 / 0xF1 / 0xF3).
+//
+//	[4 total][1 type][1 attr][1 rfid][1 flags][2 id][2 dataLen][data]
+//
+// For kind 0xF3, dataLen often does not cover the full body; when VTNV/zlib is
+// present the remainder after the 12-byte header is kept as Data.
+func parseItemRecord(body []byte, rec *nvbk.NVBKRecord) {
+	if len(body) < 12 {
+		if len(body) > 8 {
+			rec.Data = append([]byte(nil), body[8:]...)
+		}
+		return
+	}
+
+	rec.ItemID = binary.LittleEndian.Uint16(body[8:10])
+	dataLen := int(binary.LittleEndian.Uint16(body[10:12]))
+	dataStart := 12
+	rest := body[dataStart:]
+
+	switch {
+	case dataLen >= 0 && dataStart+dataLen <= len(body) && dataLen == len(body)-dataStart:
+		// Classic item: dataLen exactly fills the record.
+		rec.Data = append([]byte(nil), rest...)
+	case dataLen > 0 && dataStart+dataLen <= len(body) &&
+		!bytes.Contains(rest, []byte("VTNV")) && !hasZlib(rest[min(dataLen, len(rest)):]):
+		// Plausible short payload without trailing compressed blob.
+		rec.Data = append([]byte(nil), body[dataStart:dataStart+dataLen]...)
+	default:
+		// Extended / VTNV / mismatched dataLen: keep full remainder.
+		rec.Data = append([]byte(nil), rest...)
+	}
+
+	tryDecompressPayload(body, rec)
+}
+
+func hasZlib(b []byte) bool {
+	return bytes.Contains(b, []byte{0x78, 0x9c})
+}
+
+func tryDecompressPayload(body []byte, rec *nvbk.NVBKRecord) {
+	if bytes.Contains(body, []byte("VTNV")) {
+		rec.VTNV = true
+	}
+	idx := bytes.Index(body, []byte{0x78, 0x9c})
+	if idx < 0 {
+		return
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(body[idx:]))
 	if err != nil {
-		return 0
+		return
 	}
 	defer zr.Close()
-
-	buf := make([]byte, 8)
-	n, _ := io.ReadFull(zr, buf)
-	if n < 8 {
-		return 0
+	out, err := io.ReadAll(zr)
+	if err != nil && len(out) == 0 {
+		return
 	}
-	return int(buf[7])
+	rec.Compressed = out
+	if !rec.VTNV && idx >= 4 && bytes.Contains(body[max(0, idx-16):idx], []byte("VTNV")) {
+		rec.VTNV = true
+	}
 }
 
-// parseNVItems extracts numeric NV items from compressed sub-files. It searches
-// decompressed zlib streams, parses the ID-directory header, and recovers each
-// item's payload from ID+total+payload records in the decompressed streams.
+func entriesFromRecords(records []nvbk.NVBKRecord) []nvbk.NVBKEntry {
+	var out []nvbk.NVBKEntry
+	for _, r := range records {
+		if !nvbk.IsPathType(r.Type) || r.Name == "" {
+			continue
+		}
+		tag := binary.LittleEndian.Uint32([]byte{r.Type, r.Attr, r.RFID, r.Flags})
+		out = append(out, nvbk.NVBKEntry{
+			Name: r.Name,
+			Tag:  tag,
+			Data: r.Data,
+		})
+	}
+	return out
+}
+
+func itemsFromRecords(records []nvbk.NVBKRecord) []nvbk.NVBKItem {
+	var out []nvbk.NVBKItem
+	seen := map[uint16]struct{}{}
+
+	add := func(id uint16, data []byte) {
+		if id == 0 && len(data) == 0 {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		if len(data) == 0 {
+			return
+		}
+		// Skip pure VTNV wrapper bytes as the "item data" — prefer nested.
+		if bytes.HasPrefix(data, []byte("VTNV")) {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, nvbk.NVBKItem{
+			ID:   id,
+			Name: nvbk.LookupNVItemName(id),
+			Data: data,
+		})
+	}
+
+	for _, r := range records {
+		if !nvbk.IsItemType(r.Type) && len(r.Compressed) == 0 {
+			continue
+		}
+
+		// Inline non-compressed item payload.
+		if nvbk.IsItemType(r.Type) && !r.VTNV && len(r.Compressed) == 0 {
+			add(r.ItemID, r.Data)
+		}
+
+		// Nested items inside decompressed VTNV/zlib.
+		if len(r.Compressed) > 0 {
+			for _, it := range parseNVItemDirectory(r.Compressed) {
+				idBytes := [2]byte{byte(it.ID), byte(it.ID >> 8)}
+				if data := findNVItemInBlob(r.Compressed, idBytes); data != nil {
+					add(it.ID, data)
+				}
+			}
+			for _, it := range scanNVItemChain(r.Compressed) {
+				add(it.ID, it.Data)
+			}
+		}
+	}
+	return out
+}
+
+func mergeItems(base, extra []nvbk.NVBKItem) []nvbk.NVBKItem {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := map[uint16]struct{}{}
+	for _, it := range base {
+		seen[it.ID] = struct{}{}
+	}
+	for _, it := range extra {
+		if _, ok := seen[it.ID]; ok {
+			continue
+		}
+		if len(it.Data) == 0 {
+			continue
+		}
+		if it.Name == "" {
+			it.Name = nvbk.LookupNVItemName(it.ID)
+		}
+		base = append(base, it)
+		seen[it.ID] = struct{}{}
+	}
+	return base
+}
+
+// scanNVItemChain walks a blob as [u16 id][u16 total][data] records.
+func scanNVItemChain(blob []byte) []nvbk.NVBKItem {
+	var items []nvbk.NVBKItem
+	off := 0
+	bad := 0
+	for off+4 <= len(blob) && bad < 8 {
+		id := binary.LittleEndian.Uint16(blob[off : off+2])
+		total := int(binary.LittleEndian.Uint16(blob[off+2 : off+4]))
+		if id == 0 && total == 0 {
+			break
+		}
+		if total < 4 || total > 0x4000 || off+total > len(blob) || id == 0 {
+			off++
+			bad++
+			continue
+		}
+		next := off + total
+		if next < len(blob) && !isValidNVItemRecord(blob, next) && !isZero(blob[next:min(next+4, len(blob))]) {
+			off++
+			bad++
+			continue
+		}
+		items = append(items, nvbk.NVBKItem{
+			ID:   id,
+			Data: append([]byte(nil), blob[off+4:off+total]...),
+		})
+		off = next
+		bad = 0
+	}
+	return items
+}
+
+// parseEntries walks records and returns path entries (public helper).
+func parseEntries(raw []byte) []nvbk.NVBKEntry {
+	records, _ := parseRecords(raw)
+	return entriesFromRecords(records)
+}
+
+// parseNVItems extracts numeric NV items from zlib streams via the ID-directory
+// format used inside some RF calibration VTNV payloads.
 func parseNVItems(raw []byte) []nvbk.NVBKItem {
 	var best []nvbk.NVBKItem
 	var blobs [][]byte
@@ -380,7 +525,7 @@ func parseNVItems(raw []byte) []nvbk.NVBKItem {
 			out, _ := io.ReadAll(zr)
 			zr.Close()
 			blobs = append(blobs, out)
-			if items := parseNVItemDirectory(out); len(items) > 0 && len(items) > len(best) {
+			if items := parseNVItemDirectory(out); len(items) > len(best) {
 				best = items
 			}
 		}
@@ -396,27 +541,32 @@ func parseNVItems(raw []byte) []nvbk.NVBKItem {
 		for _, blob := range blobs {
 			if data := findNVItemInBlob(blob, idBytes); data != nil {
 				best[i].Data = data
+				best[i].Name = nvbk.LookupNVItemName(best[i].ID)
 				break
 			}
 		}
 	}
 
-	return best
+	// Drop directory IDs with no recovered payload.
+	var withData []nvbk.NVBKItem
+	for _, it := range best {
+		if len(it.Data) > 0 {
+			withData = append(withData, it)
+		}
+	}
+	return withData
 }
 
 // parseNVItemDirectory parses a single ID-directory payload.
-// The header has a count at offset 7 and is followed by 24-byte groups; each
-// group contains four 6-byte slots (4 zero bytes + 2-byte ID in little-endian).
+// Header has count at offset 7; followed by 24-byte groups of four
+// (u32 zero + u16 id) slots. Signature: byte4 == 0x34.
 func parseNVItemDirectory(data []byte) []nvbk.NVBKItem {
 	if len(data) < 16 {
 		return nil
 	}
-
 	if data[0] != 0 || data[1] != 0 || data[7] == 0 {
 		return nil
 	}
-
-	// Directory signatures observed in static_nvbk ID tables: byte 4 is 0x34.
 	if data[4] != 0x34 {
 		return nil
 	}
@@ -426,8 +576,6 @@ func parseNVItemDirectory(data []byte) []nvbk.NVBKItem {
 		return nil
 	}
 
-	// Validate that most slots have the expected zero prefix; otherwise this is
-	// probably compressed container data rather than an ID directory.
 	zeroPrefix := 0
 	totalSlots := count * 4
 	for i := range count {
@@ -456,17 +604,34 @@ func parseNVItemDirectory(data []byte) []nvbk.NVBKItem {
 	return items
 }
 
-// FindNVItem searches all sub-files (including zlib-compressed streams) for a
-// numeric NV item record with the given ID. It returns the sub-file index and
-// the record's data payload, or -1/nil if not found.
+// FindNVItem searches all sub-files for a numeric NV item with the given ID.
 func FindNVItem(f *nvbk.NVBKFile, id uint16) (int, []byte) {
+	for _, sf := range f.SubFiles {
+		for _, it := range sf.Items {
+			if it.ID == id && len(it.Data) > 0 {
+				return sf.Index, it.Data
+			}
+		}
+		for _, rec := range sf.Records {
+			if nvbk.IsItemType(rec.Type) && rec.ItemID == id && !rec.VTNV && len(rec.Data) > 0 {
+				return sf.Index, rec.Data
+			}
+		}
+	}
+
 	idBytes := [2]byte{byte(id), byte(id >> 8)}
 
 	for _, sf := range f.SubFiles {
 		if data := findNVItemInBlob(sf.Raw, idBytes); data != nil {
 			return sf.Index, data
 		}
-
+		for _, rec := range sf.Records {
+			if len(rec.Compressed) > 0 {
+				if data := findNVItemInBlob(rec.Compressed, idBytes); data != nil {
+					return sf.Index, data
+				}
+			}
+		}
 		start := 0
 		for {
 			idx := bytes.Index(sf.Raw[start:], []byte{0x78, 0x9c})
@@ -498,7 +663,6 @@ func findNVItemInBlob(blob []byte, idBytes [2]byte) []byte {
 		if total < 4 || total > 0x1000 || i+total > len(blob) {
 			continue
 		}
-		// Chain-validate: the next record must also be a valid ID+total structure.
 		if i+total < len(blob) && !isValidNVItemRecord(blob, i+total) {
 			continue
 		}
@@ -507,9 +671,6 @@ func findNVItemInBlob(blob []byte, idBytes [2]byte) []byte {
 	return nil
 }
 
-// isValidNVItemRecord reports whether a candidate record at offset off has a
-// valid ID+total structure. A zero ID with zero total is accepted as the
-// end-of-records marker (padding).
 func isValidNVItemRecord(blob []byte, off int) bool {
 	if off+4 > len(blob) {
 		return false
@@ -522,15 +683,47 @@ func isValidNVItemRecord(blob []byte, off int) bool {
 	return id != 0 && total >= 4 && total <= 0x1000 && off+total <= len(blob)
 }
 
+// populateSummary derives header Total/Valid/Verify from sub-file results.
+// There is no global Total field in the image header.
 func populateSummary(f *nvbk.NVBKFile) {
-	maxCount := 0
+	total := 0
+	valid := 0
+	allVerified := len(f.SubFiles) > 0
 	for i := range f.SubFiles {
-		if f.SubFiles[i].ItemCount > maxCount {
-			maxCount = f.SubFiles[i].ItemCount
+		sf := &f.SubFiles[i]
+		n := int(sf.RecordCount)
+		if n == 0 {
+			n = len(sf.Records)
+		}
+		total += n
+		if sf.Verified {
+			valid += n
+		} else if len(sf.Raw) == int(sf.NumSectors)*sectorSize {
+			// Complete payload but hash mismatch.
+			allVerified = false
+		} else {
+			// Truncated sample — do not fail overall Verify solely for trim.
+		}
+		// Hash mismatch on a full-size sub-file fails Verify.
+		if !sf.Verified && len(sf.Raw) == int(sf.NumSectors)*sectorSize && len(sf.Raw) > 0 {
+			allVerified = false
 		}
 	}
 
-	f.Header.Total = maxCount
-	f.Header.Valid = maxCount
-	f.Header.Verify = maxCount > 0 && len(f.SubFiles) > 0
+	// Verify = every full-size sub-file passed SHA-256.
+	for i := range f.SubFiles {
+		sf := &f.SubFiles[i]
+		full := len(sf.Raw) == int(sf.NumSectors)*sectorSize && len(sf.Raw) > 0
+		if full && !sf.Verified {
+			allVerified = false
+			break
+		}
+	}
+	if total == 0 {
+		allVerified = false
+	}
+
+	f.Header.Total = total
+	f.Header.Valid = valid
+	f.Header.Verify = allVerified && total > 0
 }

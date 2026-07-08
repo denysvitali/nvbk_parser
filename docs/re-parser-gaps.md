@@ -4,6 +4,12 @@ Audit date: 2026-07-08
 Code base: `pkg/nvbk_parser.go`, `pkg/nvbk/*`, `cmd/nvbk_parser/main.go`  
 Samples: `resources/*` (5 images + `liboemnvbk_img_helper.so` + incomplete binary templates)
 
+> **Status (2026-07-08, post-fix):** All must-have gaps below are fixed.
+> Contiguous TLV walk, u32 `RecordCount`, kinds `0x01`/`0x02`/`0xF1`–`0xF4`,
+> VTNV decompress, no false `compressedItemCount` totals, full sample coverage
+> tests, `docs/format.md`, and updated 010 templates. This file is kept as the
+> historical gap analysis.
+
 ## Executive summary
 
 `go test ./...` is green. Header / descriptor / SHA-256 plumbing works. **Payload decode is incomplete** on every sample:

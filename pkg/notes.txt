@@ -1,6 +1,37 @@
+OEMNVBK format notes (fully reverse-engineered 2026-07-08)
+===========================================================
+
+See docs/format.md for the authoritative layout.
+See docs/re-liboemnvbk-helper.md for evidence from liboemnvbk_img_helper.so.
+See docs/re-samples-decode.md for per-sample coverage.
+
 HEADER (0x200 = 512 bytes)
-================
+--------------------------
+0x00  8   magic "OEMNVBK\0"
+0x08  4   version (STA often 01 00 01 01; DYC 01 00 01 00)
+0x0c  1   sub_file_count
+0x0d  4   table_offset (always 0x1c in samples; unaligned u32)
+0x11  1   header_flag (0x00 older, 0x01 OP8-era, 0x02 newer oplus)
+0x12  3   build_time YY MM DD (binary, not BCD)
+0x15  1   reserved (0)
+0x16  6   signature_or_reserved (usually 0; oplus has ASCII tag)
+0x1c  …   descriptor table starts here when table_offset==0x1c
 
+There is NO global Total/Valid field in the header.
 
-Header:
-7 byte = OEMNVBK
+DESCRIPTOR (0x29 = 41 bytes each)
+---------------------------------
+0x00  4   record_count (u32 LE)  *** not a single-byte hint ***
+0x04  2   start_sector (payload at start_sector * 512)
+0x06  2   num_sectors  (length = num_sectors * 512)
+0x08 32   SHA-256 of full payload including trailing zero pad
+0x28  1   rf_id (0xff = manifest/common; else hw/rf variant)
+
+PAYLOAD = contiguous TLV records (count == record_count) + zero pad
+-------------------------------------------------------------------
+u32 total | u8 kind | u8 attr | u8 rfid | u8 flags | …
+
+kind 0x01 / 0xF1 / 0xF3 : numeric item  [u16 id][u16 dataLen][data]
+kind 0x02 / 0xF2 / 0xF4 : path entry    [u16 1][u16 pathLen][path][u16 2][u16 dlen][data]
+
+VTNV + zlib (78 9c) may wrap large RF payloads inside item data.

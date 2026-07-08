@@ -1,38 +1,38 @@
 //------------------------------------------------
-//--- 010 Editor v8.0.1 Binary Template
+//--- 010 Editor Binary Template — OEMNVBK (dynamic)
 //
-//      File: 
-//   Authors: 
-//   Version: 
-//   Purpose: 
-//  Category: 
-// File Mask: 
-//  ID Bytes: 
-//   History: 
+//  Same framing as static; typically 1 sub-file (rf_id 0xff)
+//  with mostly kind=0x01 numeric items. See docs/format.md.
 //------------------------------------------------
-struct Header {
-    char identifier[7] <bgcolor=0xF4A903>;
-    byte unkn_1 [5] <bgcolor=0x227ee6>;
-    unsigned short total_items <bgcolor=0x2b39c0>;
-    byte unknown[512-5-7-2];
-} header;
 
-struct Unkn {
-    byte unkn_2[56];
-} unkn;
+LittleEndian();
 
-struct Entry {
-    string fileName <bgcolor=0x3c4ce7>;
-    unsigned short separator;
-    unsigned short fileSize <bgcolor=0xad448e>;
-    
-    local quad _here = FTell();
-    FSeek(_here + fileSize);
+typedef struct {
+    char     magic[8];          // "OEMNVBK\0"
+    uchar    version[4];        // often 01 00 01 00 for DYC
+    uchar    sub_file_count;
+    uint32   table_offset;      // usually 0x1c
+    uchar    header_flag;       // often 0x01
+    uchar    build_yy;
+    uchar    build_mm;
+    uchar    build_dd;
+    uchar    reserved;
+    uchar    signature_or_reserved[6];
+} OEMNVBKHeader;
 
-    byte footer[12];
-    
-    if (separator != 0x02){
-        Warning("Invalid separator!");
-    }
-    
-} entries[999] <optimize=false>;
+typedef struct {
+    uint32   record_count;
+    uint16   start_sector;
+    uint16   num_sectors;
+    uchar    sha256[32];
+    uchar    rf_id;             // 0xff for dynamic/common
+} SubFileDesc <size=0x29>;
+
+FSeek(0);
+OEMNVBKHeader header;
+
+local int i;
+FSeek(header.table_offset);
+for (i = 0; i < header.sub_file_count; i++) {
+    SubFileDesc desc;
+}

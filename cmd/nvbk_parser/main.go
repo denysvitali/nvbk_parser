@@ -35,9 +35,16 @@ var (
 
 	listCmd = &cobra.Command{
 		Use:   "list [file]",
-		Short: "List parsed NV items",
+		Short: "List parsed NV items and path entries",
 		Args:  cobra.MaximumNArgs(1),
 		RunE:  runList,
+	}
+
+	recordsCmd = &cobra.Command{
+		Use:   "records [file]",
+		Short: "List all TLV records (full sub-file decode)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE:  runRecords,
 	}
 
 	nvGetCmd = &cobra.Command{
@@ -62,7 +69,7 @@ func init() {
 	_ = viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose"))
 	_ = viper.BindPFlag("verify", rootCmd.PersistentFlags().Lookup("verify"))
 
-	rootCmd.AddCommand(infoCmd, listCmd, nvGetCmd)
+	rootCmd.AddCommand(infoCmd, listCmd, recordsCmd, nvGetCmd)
 }
 
 func initConfig() {
@@ -151,7 +158,7 @@ func renderInfoTable(f *nvbk.NVBKFile) error {
 	showVerify := viper.GetBool("verify")
 
 	rows := [][]string{
-		{"#", "Start", "Sectors", "RF ID", "RF name", "Hint", "Items"},
+		{"#", "Start", "Sectors", "RF ID", "RF name", "Count", "Walked", "Paths", "Items", "Cover%"},
 	}
 	if showVerify {
 		rows[0] = append(rows[0], "Verified")
@@ -161,14 +168,21 @@ func renderInfoTable(f *nvbk.NVBKFile) error {
 		if rfName == "" {
 			rfName = "-"
 		}
+		cover := 0.0
+		if len(sf.Raw) > 0 {
+			cover = 100.0 * float64(sf.BytesCovered) / float64(len(sf.Raw))
+		}
 		row := []string{
 			fmt.Sprintf("%d", sf.Index),
 			fmt.Sprintf("0x%x", sf.StartSector),
 			fmt.Sprintf("%d", sf.NumSectors),
 			fmt.Sprintf("0x%02x", sf.RFID),
 			rfName,
-			fmt.Sprintf("%d", sf.CountHint),
-			fmt.Sprintf("%d", sf.ItemCount),
+			fmt.Sprintf("%d", sf.RecordCount),
+			fmt.Sprintf("%d", len(sf.Records)),
+			fmt.Sprintf("%d", len(sf.Entries)),
+			fmt.Sprintf("%d", len(sf.Items)),
+			fmt.Sprintf("%.1f", cover),
 		}
 		if showVerify {
 			verified := "no"
@@ -246,6 +260,115 @@ func runList(cmd *cobra.Command, args []string) error {
 	default:
 		return fmt.Errorf("unknown output format: %s", format)
 	}
+}
+
+func runRecords(cmd *cobra.Command, args []string) error {
+	setupLogging()
+	path, err := targetPath(args)
+	if err != nil {
+		return err
+	}
+
+	f, err := nvbkparser.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	format := strings.ToLower(viper.GetString("format"))
+	switch format {
+	case "json":
+		var out []map[string]any
+		for _, sf := range f.SubFiles {
+			for _, r := range sf.Records {
+				m := map[string]any{
+					"sub_file": sf.Index,
+					"offset":   r.Offset,
+					"total":    r.Total,
+					"type":     r.Type,
+					"attr":     r.Attr,
+					"rfid":     r.RFID,
+					"flags":    r.Flags,
+					"size":     len(r.Data),
+					"vtnv":     r.VTNV,
+				}
+				if r.Name != "" {
+					m["name"] = r.Name
+				}
+				if r.ItemID != 0 || r.Type == nvbk.RecordTypeItem {
+					m["item_id"] = r.ItemID
+				}
+				if len(r.Compressed) > 0 {
+					m["decompressed_size"] = len(r.Compressed)
+				}
+				out = append(out, m)
+			}
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	case "table", "":
+		return renderRecordsTable(f)
+	default:
+		return fmt.Errorf("unknown output format: %s", format)
+	}
+}
+
+func renderRecordsTable(f *nvbk.NVBKFile) error {
+	rows := [][]string{
+		{"Sub", "Off", "Type", "Attr", "Flags", "ID/Name", "Size", "VTNV"},
+	}
+	for _, sf := range f.SubFiles {
+		for _, r := range sf.Records {
+			idName := "-"
+			switch {
+			case r.Name != "":
+				idName = r.Name
+				if len(idName) > 48 {
+					idName = idName[:45] + "..."
+				}
+			case r.Type == nvbk.RecordTypeItem || r.ItemID != 0:
+				name := nvbk.LookupNVItemName(r.ItemID)
+				if name != "" {
+					idName = fmt.Sprintf("%d (%s)", r.ItemID, name)
+				} else {
+					idName = fmt.Sprintf("%d", r.ItemID)
+				}
+			}
+			vtnv := ""
+			if r.VTNV {
+				vtnv = fmt.Sprintf("yes/%d", len(r.Compressed))
+			}
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", sf.Index),
+				fmt.Sprintf("0x%x", r.Offset),
+				fmt.Sprintf("0x%02x", r.Type),
+				fmt.Sprintf("0x%02x", r.Attr),
+				fmt.Sprintf("0x%02x", r.Flags),
+				idName,
+				fmt.Sprintf("%d", len(r.Data)),
+				vtnv,
+			})
+		}
+	}
+
+	if len(rows) == 1 {
+		fmt.Println("No TLV records parsed from this image.")
+		return nil
+	}
+
+	t := table.New().
+		Border(lipgloss.NormalBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("#555555"))).
+		Rows(rows...).
+		StyleFunc(func(row, col int) lipgloss.Style {
+			if row == 0 {
+				return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F1F"))
+			}
+			return lipgloss.NewStyle()
+		})
+
+	fmt.Println(t.Render())
+	return nil
 }
 
 func renderListTable(f *nvbk.NVBKFile) error {
