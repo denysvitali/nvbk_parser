@@ -14,7 +14,9 @@ func TestLookupRFIDName(t *testing.T) {
 }
 
 func TestLookupNVItemName(t *testing.T) {
-	// The known-name map is intentionally empty by default.
-	assert.Equal(t, "", LookupNVItemName(1))
+	assert.Equal(t, "RFNV_LTE_CA_BW_CLASS_COMBO_I", LookupNVItemName(28874))
+	assert.Equal(t, "RFNV_RF_CARD_CONFIG_I", LookupNVItemName(28967))
+	assert.Equal(t, "RFNV_LTE_CA_LIST_I", LookupNVItemName(29002))
+	assert.Equal(t, "ue_imei", LookupNVItemName(550))
 	assert.Equal(t, "", LookupNVItemName(65535))
 }
